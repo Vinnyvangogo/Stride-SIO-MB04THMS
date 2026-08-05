@@ -2,7 +2,7 @@
 """
 Stride Field I/O SIO-MB04THMS - 4-Channel Thermocouple Monitor
 =================================================================
-ver 3
+ver4
 Reads all 4 thermocouple channels from a Stride SIO-MB04THMS Modbus TCP
 temperature module and displays them on a live-updating, dark-themed GUI.
 
@@ -24,6 +24,7 @@ section below as needed.
 """
 
 import csv
+import inspect
 import queue
 import threading
 import time
@@ -87,6 +88,7 @@ class ModbusWorker(threading.Thread):
         self.interval = DEFAULT_INTERVAL_S
         self._stop_event = threading.Event()
         self.client = None
+        self._id_kwarg = None  # resolved lazily to the working strategy index
 
     def set_interval(self, seconds):
         self.interval = max(MIN_INTERVAL_S, min(MAX_INTERVAL_S, seconds))
@@ -102,23 +104,42 @@ class ModbusWorker(threading.Thread):
         return self.client.connected
 
     def _read_holding_registers(self, address, count):
-        """Version-agnostic wrapper: newer pymodbus (3.x) expects the
-        slave/unit id as 'slave', older versions (2.x) expect 'unit', and
-        some builds accept it as a plain positional argument instead."""
-        try:
-            return self.client.read_holding_registers(
-                address=address, count=count, slave=self.unit_id
-            )
-        except TypeError:
-            pass
-        try:
-            return self.client.read_holding_registers(
-                address=address, count=count, unit=self.unit_id
-            )
-        except TypeError:
-            pass
-        # Last resort: positional unit id
-        return self.client.read_holding_registers(address, count, self.unit_id)
+        """Version-agnostic wrapper. Different pymodbus releases (and even
+        different point releases within 3.x) have used different calling
+        conventions for read_holding_registers - keyword-only 'slave',
+        keyword-only 'device_id', keyword-only 'unit', or various mixes of
+        positional/keyword args. Rather than guess once, try a list of
+        known-good calling conventions and lock onto whichever one this
+        installed version actually accepts."""
+        uid = self.unit_id
+        strategies = [
+            lambda: self.client.read_holding_registers(address=address, count=count, slave=uid),
+            lambda: self.client.read_holding_registers(address=address, count=count, device_id=uid),
+            lambda: self.client.read_holding_registers(address=address, count=count, unit=uid),
+            lambda: self.client.read_holding_registers(address, count=count, slave=uid),
+            lambda: self.client.read_holding_registers(address, count, uid),
+            lambda: self.client.read_holding_registers(address, count),
+            lambda: self.client.read_holding_registers(address=address, count=count),
+        ]
+
+        # If a strategy has already proven to work, use it directly first.
+        if self._id_kwarg is not None:
+            try:
+                return strategies[self._id_kwarg]()
+            except TypeError:
+                pass  # fall through and re-probe below
+
+        last_exc = None
+        for idx, strategy in enumerate(strategies):
+            try:
+                result = strategy()
+            except TypeError as exc:
+                last_exc = exc
+                continue
+            self._id_kwarg = idx
+            return result
+
+        raise last_exc
 
     def run(self):
         while not self._stop_event.is_set():
