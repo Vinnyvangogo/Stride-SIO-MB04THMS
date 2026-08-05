@@ -2,7 +2,7 @@
 """
 Stride Field I/O SIO-MB04THMS - 4-Channel Thermocouple Monitor
 =================================================================
-ver 5
+ver 6
 Reads all 4 thermocouple channels from a Stride SIO-MB04THMS Modbus TCP
 temperature module and displays them on a live-updating, dark-themed GUI.
 
@@ -21,15 +21,24 @@ Requirements:
 
 Tested against pymodbus 3.x. Adjust IP / unit ID / port in the CONFIG
 section below as needed.
+
+Daily behavior:
+    - The live plot accumulates a full day's worth of readings and clears
+      itself automatically at midnight to start the next day fresh.
+    - If CSV recording is active when midnight hits, the current file is
+      closed and a new one is opened automatically (one file per day,
+      named "thermocouple_log_YYYY-MM-DD.csv" in the folder chosen when
+      recording was started).
 """
 
 import csv
+import os
 import queue
 import threading
 import time
 import tkinter as tk
 from collections import deque
-from datetime import datetime
+from datetime import datetime, date
 from tkinter import filedialog, messagebox, ttk
 
 import matplotlib
@@ -66,10 +75,12 @@ CHANNEL_NAMES = ["Channel 1 (Ch0)", "Channel 2 (Ch1)",
                   "Channel 3 (Ch2)", "Channel 4 (Ch3)"]
 CHANNEL_COLORS = ["#ff5555", "#55ff88", "#5599ff", "#ffcc55"]
 
-MAX_PLOT_POINTS = 600           # rolling window shown on the graph
+MAX_PLOT_POINTS = None          # None = unbounded; buffer auto-resets at
+                                 # midnight so it only ever holds one day
 DEFAULT_INTERVAL_S = 5
 MIN_INTERVAL_S = 1
 MAX_INTERVAL_S = 60
+CSV_FILENAME_PREFIX = "thermocouple_log"
 
 
 def raw_to_signed16(val):
@@ -216,15 +227,18 @@ class ThermocoupleApp:
         self.data_queue = queue.Queue()
         self.worker = ModbusWorker(DEVICE_IP, DEVICE_PORT, UNIT_ID, self.data_queue)
 
-        # Rolling buffers for plotting
+        # Rolling buffers for plotting - hold one full day, reset at midnight
         self.times = deque(maxlen=MAX_PLOT_POINTS)
         self.channel_data = [deque(maxlen=MAX_PLOT_POINTS) for _ in range(4)]
         self.channel_visible = [True, True, True, True]
+        self.current_day = date.today()
 
         # CSV recording state
         self.recording = False
         self.csv_file = None
         self.csv_writer = None
+        self.record_dir = None   # directory chosen when recording started;
+                                  # daily rollover files are written here
 
         self._build_style()
         self._build_layout()
@@ -331,7 +345,7 @@ class ThermocoupleApp:
         self.ax.set_facecolor("#161616")
         self.ax.set_xlabel("Time")
         self.ax.set_ylabel("Temperature (\u00b0C)")
-        self.ax.set_title("SIO-MB04THMS Live Thermocouple Readings")
+        self.ax.set_title(f"SIO-MB04THMS Live Thermocouple Readings - {self.current_day:%Y-%m-%d}")
         self.ax.grid(True, color="#3a3a3a", linestyle="--", linewidth=0.5)
 
         # Explicit date handling on the x-axis so real clock times are shown
@@ -357,7 +371,7 @@ class ThermocoupleApp:
             leg_line.set_picker(8)
             self.legend_map[leg_line] = orig_line
 
-        self.fig.tight_layout()
+        self.fig.subplots_adjust(bottom=0.22, left=0.08, right=0.98, top=0.92)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_container)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -390,28 +404,44 @@ class ThermocoupleApp:
     # ------------------------------------------------------------------
     # CSV Recording
     # ------------------------------------------------------------------
-    def _start_recording(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv")],
-            initialfile=f"thermocouple_log_{datetime.now():%Y%m%d_%H%M%S}.csv",
-            title="Save temperature log as..."
-        )
-        if not path:
-            return
-        try:
-            self.csv_file = open(path, "w", newline="", encoding="utf-8")
-            self.csv_writer = csv.writer(self.csv_file)
+    def _dated_csv_path(self, for_date):
+        """Build the log file path for a given date inside the chosen
+        recording directory, e.g. thermocouple_log_2026-08-05.csv"""
+        filename = f"{CSV_FILENAME_PREFIX}_{for_date:%Y-%m-%d}.csv"
+        return os.path.join(self.record_dir, filename)
+
+    def _open_csv_for_day(self, for_date):
+        """(Re)open the CSV writer pointed at the log file for the given
+        day, writing the header row. Used both on Start Recording and on
+        the automatic midnight rollover."""
+        path = self._dated_csv_path(for_date)
+        self.csv_file = open(path, "a", newline="", encoding="utf-8")
+        self.csv_writer = csv.writer(self.csv_file)
+        # Only write the header if this is a brand-new (empty) file, so
+        # resuming recording later in the same day doesn't duplicate it.
+        if self.csv_file.tell() == 0:
             self.csv_writer.writerow(["Timestamp", "Channel1_C", "Channel2_C",
                                        "Channel3_C", "Channel4_C"])
-            self.csv_file.flush()
+        self.csv_file.flush()
+        self.rec_status_lbl.config(text=f"Recording: {os.path.basename(path)}")
+
+    def _start_recording(self):
+        directory = filedialog.askdirectory(
+            title="Choose folder to save daily temperature logs in"
+        )
+        if not directory:
+            return
+        self.record_dir = directory
+
+        try:
+            self._open_csv_for_day(self.current_day)
         except OSError as exc:
             messagebox.showerror("File Error", f"Could not open file:\n{exc}")
+            self.record_dir = None
             return
 
         self.recording = True
         self.rec_led.itemconfig(self.rec_led_id, fill="#33dd33")
-        self.rec_status_lbl.config(text=f"Recording: {path.split('/')[-1]}")
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
 
@@ -454,6 +484,12 @@ class ThermocoupleApp:
         temps = reading["temps"]
         ts = reading["timestamp"]
 
+        # Detect the calendar day rolling over (checked on every reading,
+        # even if this particular poll failed to connect, since the
+        # worker always timestamps its result with the current time).
+        if ts.date() != self.current_day:
+            self._rollover_day(ts.date())
+
         # Update connection LED
         if connected:
             self.conn_led.itemconfig(self.conn_led_id, fill="#33dd33")
@@ -475,6 +511,41 @@ class ThermocoupleApp:
                 row = [ts.strftime("%Y-%m-%d %H:%M:%S")] + [f"{t:.1f}" for t in temps]
                 self.csv_writer.writerow(row)
                 self.csv_file.flush()
+
+    def _rollover_day(self, new_day):
+        """Called automatically the first time a reading's timestamp
+        crosses into a new calendar day (i.e. at/after midnight). Clears
+        the plot so the graph starts fresh for the new day, and - if a
+        recording is in progress - closes the previous day's CSV file and
+        opens a new dated one so each day gets its own file."""
+        self.current_day = new_day
+
+        # Clear plotted data/buffers for the new day.
+        self.times.clear()
+        for dq in self.channel_data:
+            dq.clear()
+        for line in self.lines:
+            line.set_data([], [])
+        self.ax.set_title(f"SIO-MB04THMS Live Thermocouple Readings - {new_day:%Y-%m-%d}")
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.canvas.draw_idle()
+
+        # Roll the CSV file over too, if we're currently recording.
+        if self.recording:
+            if self.csv_file:
+                try:
+                    self.csv_file.close()
+                except Exception:
+                    pass
+            try:
+                self._open_csv_for_day(new_day)
+            except OSError as exc:
+                messagebox.showerror(
+                    "File Error",
+                    f"Could not open new day's log file:\n{exc}\n\nRecording stopped."
+                )
+                self._stop_recording()
 
     def _redraw_plot(self):
         if not self.times:
