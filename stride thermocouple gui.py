@@ -2,7 +2,7 @@
 """
 Stride Field I/O SIO-MB04THMS - 4-Channel Thermocouple Monitor
 =================================================================
-
+ver 3
 Reads all 4 thermocouple channels from a Stride SIO-MB04THMS Modbus TCP
 temperature module and displays them on a live-updating, dark-themed GUI.
 
