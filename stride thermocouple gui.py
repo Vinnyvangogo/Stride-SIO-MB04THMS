@@ -101,6 +101,25 @@ class ModbusWorker(threading.Thread):
             self.client.connect()
         return self.client.connected
 
+    def _read_holding_registers(self, address, count):
+        """Version-agnostic wrapper: newer pymodbus (3.x) expects the
+        slave/unit id as 'slave', older versions (2.x) expect 'unit', and
+        some builds accept it as a plain positional argument instead."""
+        try:
+            return self.client.read_holding_registers(
+                address=address, count=count, slave=self.unit_id
+            )
+        except TypeError:
+            pass
+        try:
+            return self.client.read_holding_registers(
+                address=address, count=count, unit=self.unit_id
+            )
+        except TypeError:
+            pass
+        # Last resort: positional unit id
+        return self.client.read_holding_registers(address, count, self.unit_id)
+
     def run(self):
         while not self._stop_event.is_set():
             start_time = time.time()
@@ -111,12 +130,8 @@ class ModbusWorker(threading.Thread):
 
             try:
                 if self._ensure_connected():
-                    rr = self.client.read_holding_registers(
-                        address=CH_START_ADDR, count=4, slave=self.unit_id
-                    )
-                    br = self.client.read_holding_registers(
-                        address=BREAK_ADDR, count=1, slave=self.unit_id
-                    )
+                    rr = self._read_holding_registers(CH_START_ADDR, 4)
+                    br = self._read_holding_registers(BREAK_ADDR, 1)
                     if (not rr.isError()) and (not br.isError()):
                         connected = True
                         temps = [raw_to_signed16(v) / 10.0 for v in rr.registers]
@@ -470,4 +485,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
