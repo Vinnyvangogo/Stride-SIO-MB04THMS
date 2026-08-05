@@ -2,7 +2,7 @@
 """
 Stride Field I/O SIO-MB04THMS - 4-Channel Thermocouple Monitor
 =================================================================
-ver4
+ver 5
 Reads all 4 thermocouple channels from a Stride SIO-MB04THMS Modbus TCP
 temperature module and displays them on a live-updating, dark-themed GUI.
 
@@ -24,7 +24,6 @@ section below as needed.
 """
 
 import csv
-import inspect
 import queue
 import threading
 import time
@@ -35,6 +34,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import matplotlib
 matplotlib.use("TkAgg")
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -45,6 +45,12 @@ except ImportError:
     raise SystemExit(
         "pymodbus is required. Install it with:  pip install pymodbus"
     )
+
+try:
+    import pymodbus
+    PYMODBUS_VERSION = getattr(pymodbus, "__version__", "unknown")
+except Exception:
+    PYMODBUS_VERSION = "unknown"
 
 # ----------------------------------------------------------------------
 # CONFIG
@@ -203,7 +209,7 @@ class ThermocoupleApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Stride SIO-MB04THMS - Thermocouple Monitor")
+        self.root.title(f"Stride SIO-MB04THMS - Thermocouple Monitor  (pymodbus {PYMODBUS_VERSION})")
         self.root.geometry("1150x720")
         self.root.configure(bg=self.BG)
 
@@ -327,6 +333,15 @@ class ThermocoupleApp:
         self.ax.set_ylabel("Temperature (\u00b0C)")
         self.ax.set_title("SIO-MB04THMS Live Thermocouple Readings")
         self.ax.grid(True, color="#3a3a3a", linestyle="--", linewidth=0.5)
+
+        # Explicit date handling on the x-axis so real clock times are shown
+        # (rather than matplotlib's default numeric/ordinal tick labels).
+        self.ax.xaxis_date()
+        self.ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
+        for label in self.ax.get_xticklabels():
+            label.set_rotation(25)
+            label.set_ha("right")
 
         self.lines = []
         for i in range(4):
@@ -464,13 +479,12 @@ class ThermocoupleApp:
     def _redraw_plot(self):
         if not self.times:
             return
-        x_vals = list(self.times)
+        x_vals = mdates.date2num(list(self.times))
         for i, line in enumerate(self.lines):
             line.set_data(x_vals, list(self.channel_data[i]))
 
         self.ax.relim()
         self.ax.autoscale_view()
-        self.fig.autofmt_xdate(rotation=25)
         self.canvas.draw_idle()
 
     def _update_status_bar(self, reading):
